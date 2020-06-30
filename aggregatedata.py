@@ -26,6 +26,8 @@ __author__ = 'arwi'
 
 _pwl = re.compile("(DH|SH|FC)")
 
+CSV_VERSION = "0"
+
 DIRECTIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 WIND_SPEEDS = {
@@ -45,7 +47,10 @@ PROBLEMS = {
     7: 'new-slab',
     10: 'drift-slab',
     30: 'pwl-slab',
-    37: 'dpwl-slab',
+    # This was safe to do when it was written (rewriting dpwl as pwl).
+    # If reverse lookups are done in the future, or if an .items() iteration
+    # is done, this may break something.
+    37: 'pwl-slab',
     45: 'wet-slab',
     50: 'glide'
 }
@@ -583,8 +588,8 @@ class LabeledData:
         regobs = ""
         if len(self.regobs_types) and self.days >= 2:
             regobs = f"_regobs_{'_'.join([REG_ENG[obs_type] for obs_type in self.regobs_types])}"
-        pathname_data = f"{se.local_storage}data_days_{self.days}{regobs}.csv"
-        pathname_label = f"{se.local_storage}label_days_{self.days}{regobs}.csv"
+        pathname_data = f"{se.local_storage}data_v{CSV_VERSION}_days_{self.days}{regobs}.csv"
+        pathname_label = f"{se.local_storage}label_v{CSV_VERSION}_days_{self.days}{regobs}.csv"
         ld = self.denormalize()
         ld.data.to_csv(pathname_data, sep=';')
         ld.label.to_csv(pathname_label, sep=';')
@@ -606,8 +611,8 @@ class LabeledData:
         regobs = ""
         if len(regobs_types) and days >= 2:
             regobs = f"_regobs_{'_'.join([REG_ENG[obs_type] for obs_type in regobs_types])}"
-        pathname_data = f"{se.local_storage}data_days_{days}{regobs}.csv"
-        pathname_label = f"{se.local_storage}label_days_{days}{regobs}.csv"
+        pathname_data = f"{se.local_storage}data_v{CSV_VERSION}_days_{days}{regobs}.csv"
+        pathname_label = f"{se.local_storage}label_v{CSV_VERSION}_days_{days}{regobs}.csv"
         try:
             data = pandas.read_csv(pathname_data, sep=";", header=[0, 1], index_col=0)
             label = pandas.read_csv(pathname_label, sep=";", header=[0, 1], index_col=0, low_memory=False)
