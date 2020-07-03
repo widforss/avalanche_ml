@@ -14,6 +14,7 @@ import numpy as np
 import pandas
 import requests
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import KFold
 
 sys.path.insert(0, "./varsomdata")
 import setenvironment as se
@@ -26,7 +27,9 @@ __author__ = 'arwi'
 
 _pwl = re.compile("(DH|SH|FC)")
 
-CSV_VERSION = "0"
+CSV_VERSION = "4"
+
+_NONE = ""
 
 DIRECTIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
@@ -67,7 +70,6 @@ CAUSES = {
     20: 'ground-water',
     22: 'water-layers',
     24: 'loose',
-    25: 'rain-temp-sun',
 }
 
 AVALANCHE_EXT = {
@@ -353,12 +355,12 @@ class ForecastDataset:
 
             # Problem data
             prb = {}
-            problem_types = [PROBLEMS.get(p.avalanche_problem_type_id, None) for p in forecast.avalanche_problems]
+            problem_types = [PROBLEMS.get(p.avalanche_problem_type_id, _NONE) for p in forecast.avalanche_problems]
             problems = {}
             prb['problem_amount'] = len(forecast.avalanche_problems)
             label[('problem_amount', 'CLASS')] = prb['problem_amount']
             for i in range(1, 4):
-                label[(f"problem_{i}", "CLASS")] = "none"
+                label[(f"problem_{i}", "CLASS")] = _NONE
             for problem in PROBLEMS.values():
                 if problem in problem_types:
                     index = problem_types.index(problem)
@@ -370,7 +372,7 @@ class ForecastDataset:
                     prb[f"problem_{problem}"] = 0
             for problem in PROBLEMS.values():
                 p_data = problems[problem]
-                forecast_cause = CAUSES.get(p_data.aval_cause_id, None)
+                forecast_cause = CAUSES.get(p_data.aval_cause_id, _NONE)
                 for cause in CAUSES.values():
                     prb[f"problem_{problem}_cause_{cause}"] = float(forecast_cause == cause)
                 prb[f"problem_{problem}_dsize"] = p_data.destructive_size_ext_id
@@ -392,7 +394,7 @@ class ForecastDataset:
                 for n in range(0, 8):
                     aspect_attr_name = f"problem_{problem}_aspect_{DIRECTIONS[n]}"
                     prb[aspect_attr_name] = float(p_data.valid_expositions[n])
-                    label[(aspect_attr_name, 'CLASS')] = prb[aspect_attr_name]
+                label[(f"problem_{problem}_aspect", 'MULTICLASS')] = p_data.valid_expositions.zfill(8)
 
                 label[(f"problem_{problem}_lev_max", 'REAL')] = p_data.exposed_height_1
                 label[(f"problem_{problem}_lev_min", 'REAL')] = p_data.exposed_height_2
@@ -529,6 +531,7 @@ class LabeledData:
         """
         self.data = data
         self.label = label
+        self.pred = pandas.DataFrame(index=label.index, columns=label.columns)
         self.days = days
         self.regobs_types = regobs_types
         self.scaler.fit(self.data)
@@ -560,6 +563,21 @@ class LabeledData:
             return ld
         else:
             return self.copy()
+
+    def kfold(self, k=5, shuffle=True):
+        kf = KFold(n_splits=k, shuffle=shuffle)
+        array = []
+        for train_index, test_index in kf.split(self.data):
+            training_data = self.copy()
+            training_data.data = self.data.iloc[train_index]
+            training_data.label = self.label.iloc[train_index]
+            training_data.pred = self.pred.iloc[train_index]
+            testing_data = self.copy()
+            testing_data.data = self.data.iloc[test_index]
+            testing_data.label = self.label.iloc[test_index]
+            training_data.pred = self.pred.iloc[test_index]
+            array.append((training_data, testing_data))
+        return array
 
     def to_timeseries(self):
         """Formats the data in a way that is parseable for e.g. `tslearn`. That is, a numpy array with
@@ -597,7 +615,9 @@ class LabeledData:
     def copy(self):
         """Deep copy LabeledData."""
         ld = LabeledData(self.data.copy(), self.label.copy(), self.days, copy.copy(self.regobs_types))
+        ld.is_normalized = self.is_normalized
         ld.scaler = self.scaler
+        ld.pred = self.pred
         return ld
 
     @staticmethod

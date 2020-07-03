@@ -1,20 +1,8 @@
-import datetime as dt
-import os
-import pickle
-import re
 import sys
-import time
-from collections import OrderedDict
-from aggregatedata import ForecastDataset, LabeledData, REG_ENG, CsvMissingError
-
+from aggregatedata import ForecastDataset, LabeledData, REG_ENG, PROBLEMS, DIRECTIONS, _NONE, CsvMissingError
+from sklearn.ensemble import RandomForestClassifier
 import numpy as np
 import pandas
-import requests
-from sklearn.metrics import f1_score
-from sklearn.model_selection import KFold
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.layers import Dense, LSTM
-from tensorflow.keras.models import Sequential
 
 sys.path.insert(0, "./varsomdata")
 import setenvironment as se
@@ -25,8 +13,6 @@ from varsomdata import getmisc as gm
 
 __author__ = 'arwi'
 
-_ap = lambda x: f"avalanche_problem_{x}_"
-_NONE = "none"
 LABEL_GLOBAL = {
     "danger_level": {
         "train": True,
@@ -61,7 +47,7 @@ LABEL_GLOBAL = {
 for n in range(1, 4):
     LABEL_GLOBAL[f"problem_{n}"] = {
         "train": True,
-        "ext_attr": [f"{_ap(n)}{attr}" for attr in [
+        "ext_attr": [f"avalanche_problem_{n}_{attr}" for attr in [
             "problem_type_id", "problem_type_name", "type_id", "type_name", "ext_id", "ext_name"
         ]],
         "values": {
@@ -78,7 +64,7 @@ for n in range(1, 4):
 
 LABEL_PROBLEM = {
     "cause": {
-        "train": False,
+        "train": True,
         "ext_attr": ["cause_id", "cause_name"],
         "values": {
             "new-snow": [10, "Nedføyket svakt lag med nysnø"],
@@ -90,12 +76,12 @@ LABEL_PROBLEM = {
             "crust-above-facet": [18, "Kantkornet snø over skarelag"],
             "crust-below-facet": [19, "Kantkornet snø under skarelag"],
             "ground-water": [20, "Vann ved bakken/smelting fra bakken"],
-            "loose": [22, "Opphopning av vann i/over lag i snødekket"],
-            "rain-temp-sun": [24, "Ubunden snø"]
+            "water-layers": [22, "Opphopning av vann i/over lag i snødekket"],
+            "loose": [24, "Ubunden snø"]
         }
     },
     "dsize": {
-        "train": False,
+        "train": True,
         "ext_attr": ["destructive_size_ext_id", "destructive_size_ext_name"],
         "values": {
             1: [1, "1 - Små"],
@@ -106,7 +92,7 @@ LABEL_PROBLEM = {
         }
     },
     "prob": {
-        "train": False,
+        "train": True,
         "ext_attr": ["probability_id", "probability_name"],
         "values": {
             2: [2, "Lite sannsynlig"],
@@ -115,7 +101,7 @@ LABEL_PROBLEM = {
         }
     },
     "trig": {
-        "train": False,
+        "train": True,
         "ext_attr": ["trigger_simple_id", "trigger_simple_name"],
         "values": {
             10: [10, "Stor tilleggsbelastning"],
@@ -124,7 +110,7 @@ LABEL_PROBLEM = {
         }
     },
     "dist": {
-        "train": False,
+        "train": True,
         "ext_attr": ["distribution_id", "distribution_name"],
         "values": {
             1: [1, "Få bratte heng"],
@@ -134,8 +120,8 @@ LABEL_PROBLEM = {
         }
     },
     "lev_fill": {
-        "train": False,
-        "ext_attr": ["avalanche_problem_1_exposed_height_fill"],
+        "train": True,
+        "ext_attr": ["exposed_height_fill"],
         "values": {
             1: [1],
             2: [2],
@@ -145,63 +131,251 @@ LABEL_PROBLEM = {
     }
 }
 
+LABEL_PROBLEM_MULTI = {
+    "aspect": {
+        "train": True,
+        "ext_attr": ["valid_expositions"],
+        "classes": DIRECTIONS
+    }
+}
+
+LABEL_PROBLEM_REAL = {
+    #"lev_max": {
+    #    "train": True,
+    #    "ext_attr": "exposed_height_1",
+    #    "offset": 0,
+    #    "scale": 1800
+    #},
+    #"lev_min": {
+    #    "train": True,
+    #    "ext_attr": "exposed_height_2",
+    #    "offset": 0,
+    #    "scale": 1600
+    #}
+}
+
 
 class BulletinMachine:
-    def __init__(self, ml_class_creator):
+    def __init__(self, ml_class_creator, ml_multiclass_creator, ml_real_creator):
+        """Facilitates training and prediction of avalanche warnings.
+
+        :param ml_class_creator: fn(in_size: Int, out_size: Int) -> classifier, where model supports model.fit(X, y)
+                                 and model.predict(X) that returns softmax array or 1-hot.
+        :param ml_multiclass_creator: fn(in_size: Int, out_size: Int) -> classifier, where model supports
+                                 model.fit(X, y) and model.predict(X) that returns k-hot.
+        :param ml_real_creator: fn(in_size: Int, out_size: Int) -> regressor, where model supports model.fit(X, y)
+                                 and model.predict(X) that returns k-hot.
+        """
         self.ml_class_creator = ml_class_creator
-        self.machines_global = {}
-        self.machines_problem = {}
-        self.labels = {}
+        self.ml_multiclass_creator = ml_multiclass_creator
+        self.ml_real_creator = ml_real_creator
+        self.machines = {}
+        self.labels_class = {}
+        self.labels_multi = {}
+        self.labels_real = {}
         self.X = None
         self.y = None
         self.is_timeseries = False
         self.fitted = False
+        self.columns = []
 
-    def fit(self, labeled_data, is_timeseries, epochs, verbose=0):
+    def fit(self, labeled_data, epochs, verbose=0):
+        """
+
+        :param labeled_data: LabeledData: Dataset that the models should be fit after.
+        :param epochs: Int. Number of epochs to train. Ignored if the supplied model doesn't
+                       support the parameter.
+        :param verbose: Int. Verbosity of the models. Ignored if not supported of the supplied
+                        models.
+        """
         if self.fitted:
             raise AlreadyFittedError()
         self.fitted = True
-        self.is_timeseries = is_timeseries
-        labeled_data.normalize()
-        self.y = labeled_data.label
-        self.X = labeled_data.to_timeseries()[0] if is_timeseries else labeled_data.data.values
-        for column in labeled_data.label.columns:
-            if column[0] in LABEL_GLOBAL and LABEL_GLOBAL[column[0]]["train"]:
-                self.labels[column[0]] = pandas.DataFrame(
-                    pandas.get_dummies(labeled_data.label[column]),
-                    columns=list(LABEL_GLOBAL[column[0]]["values"].keys())
+        labeled_data = labeled_data.normalize()
+        self.y = labeled_data.label.replace(np.nan, _NONE, regex=True)
+        self.columns = labeled_data.data.columns
+        for column in [prop[0] for prop in LABEL_GLOBAL.items() if prop[1]["train"]]:
+            categories = list(LABEL_GLOBAL[column]["values"].keys())
+            self.labels_class[column] = pandas.DataFrame(
+                pandas.get_dummies(self.y[(column, "CLASS")], columns=categories),
+                columns=categories
+            ).fillna(0)
+        for problem in PROBLEMS.values():
+            for prop in [prop[0] for prop in LABEL_PROBLEM.items() if prop[1]["train"]]:
+                column = f"problem_{problem}_{prop}"
+                categories = list(LABEL_PROBLEM[prop]["values"].keys())
+                self.labels_class[column] = pandas.DataFrame(
+                    pandas.get_dummies(self.y[(column, "CLASS")], columns=categories),
+                    columns=categories
                 ).fillna(0)
-        for label, dummies in self.labels.items():
-            self.machines_global[label] = self.ml_class_creator(self.X.shape[1:], len(dummies.columns))
+            for prop in [prop[0] for prop in LABEL_PROBLEM_MULTI.items() if prop[1]["train"]]:
+                column = f"problem_{problem}_{prop}"
+                labels = np.char.zfill(self.y[(column, "MULTICLASS")].values.astype("U"), 8)
+                labels = np.char.split(np.char.replace(np.char.replace(labels, "0", "0,"), "1", "1,"), ",", 7)
+                labels = np.char.startswith(np.stack(labels), "1").astype(np.float)
+                self.labels_multi[column] = pandas.DataFrame(labels).fillna(0)
+            for prop, d in [(prop[0], prop[1]) for prop in LABEL_PROBLEM_REAL.items() if prop[1]["train"]]:
+                column = f"problem_{problem}_{prop}"
+                self.labels_real[column] = (self.y[column] - d["offset"]) / d["scale"]
 
-        for attr, machine in self.machines_global.items():
-            machine.fit(self.X, self.labels[attr], epochs=epochs, verbose=verbose)
+        labels = [(i, "single") for i in self.labels_class.items()]
+        labels += [(i, "multi") for i in self.labels_multi.items()]
+        labels += [((key, pandas.DataFrame(columns=[1])), "real") for key in self.labels_multi.keys()]
+        for (label, dummies), type in labels:
+            self.X = labeled_data.data.values
+            machine_creator = {
+                "single": self.ml_class_creator,
+                "multi": self.ml_multiclass_creator,
+                "real": self.ml_real_creator
+            }[type]
+            try:
+                self.machines[label] = machine_creator(self.X.shape[1:], len(dummies.columns))
+            except ValueError:
+                self.X = labeled_data.to_timeseries()[0]
+                self.is_timeseries = True
+                self.machines[label] = machine_creator(self.X.shape[1:], len(dummies.columns))
 
-    def predict(self, unlabeled_data):
-        def _predict_class(attr, machine_scope, label_scope):
+        for (attr, _), type in labels:
+            machine = self.machines[attr]
+            rel_labels = {
+                "single": self.labels_class,
+                "multi": self.labels_multi,
+                "real": self.labels_real
+            }[type]
+            idx = np.sum(rel_labels[attr], axis=1).astype(np.bool)
+            print(f"Fitting: {attr}")
+            try:
+                machine.fit(self.X[np.ix_(idx)], rel_labels[attr].loc[idx], epochs=epochs, verbose=verbose)
+            except TypeError:
+                machine.fit(self.X[np.ix_(idx)], rel_labels[attr].loc[idx])
+
+    def predict(self, data):
+        """
+
+        :param data: LabeledData. Dataset to predict. May have empty LabeledData.label.
+        :return: LabeledData. A copy of data, with LabeledData.pred filled in.
+        """
+        def _predict_class(rows, attr, label_attr, machine_scope, label_scope):
             machine = machine_scope[attr]
-            idx = np.argmax(machine.predict(X), axis=1)
-            y[(attr, "CLASS")] = np.array(list(LABEL_GLOBAL[attr]["values"].keys()))[idx]
+            idx = np.argmax(machine.predict(X[np.ix_(rows)]), axis=1)
+            y.loc[rows, (attr, "CLASS")] = np.array(list(label_scope[label_attr]["values"].keys()))[idx]
 
         if not self.fitted:
             raise NotFittedError()
 
-        unlabeled_data.normalize()
-        X = unlabeled_data.to_timeseries()[0] if self.is_timeseries else unlabeled_data.data.values
-        y = pandas.DataFrame(index=unlabeled_data.data.index, columns=self.y.columns)
-        y = y.fillna(0).astype(self.y.dtypes.to_dict())
+        data = data.normalize()
+        X = data.to_timeseries()[0] if self.is_timeseries else data.data.values
+        y = pandas.DataFrame(index=data.data.index, columns=self.y.columns).fillna(0).astype(self.y.dtypes.to_dict())
+        y.loc[:, y.dtypes == np.object] = _NONE
         for attr in ["danger_level", "emergency_warning"]:
-            _predict_class(attr, self.machines_global, LABEL_GLOBAL)
+            _predict_class([True] * y.shape[0], attr, attr, self.machines, LABEL_GLOBAL)
 
-        last_argmax = None
-        for n in range(1, 4):
-            argmax = np.argmax(self.machines_global[f"problem_{n}"].predict(X), axis=1)
-            # Set to None if problem_n-1 was None.
-            argmax = argmax if last_argmax is None else argmax * last_argmax.astype(np.bool)
-            last_argmax = argmax
-            y[("problem_amount", "CLASS")] = y[("problem_amount", "CLASS")] + argmax.astype(np.bool)
-            y[(f"problem_{n}", "CLASS")] = np.array(list(LABEL_GLOBAL[f"problem_{n}"]["values"].keys()))[argmax]
-        return y
+        softmax = np.stack([self.machines[f"problem_{n}"].predict(X) for n in [1, 2, 3]], axis=1)
+        idxs = np.flip(softmax.argsort(axis=2), axis=2)
+        is_prob = np.any(np.sum(softmax.astype(np.bool), axis=2) > 1)
+        for _ in [0, 1]:
+            if is_prob:
+                # If second likeliest problem_n-1 is very likely, use that instead
+                fst = np.expand_dims(np.arange(y.shape[0]), axis=1)
+                sec = [[0, 1]] * y.shape[0]
+                likely = softmax[fst, sec, idxs[fst, sec, 1]] > 0.75 * softmax[fst, sec, idxs[fst, sec, 0]]
+                idxs[:, 1:, 0] = idxs[:, 1:, 0] * np.invert(likely) + idxs[:, :-1, 1] * likely
+                # If equal to problem_n-1/2, set to second likeliest alternative.
+                prev_eq = idxs[:, 1:, :1] == idxs[:, :-1, :1]
+                idxs[:, 1:, :-1] = idxs[:, 1:, :-1] * np.invert(prev_eq) + idxs[:, 1:, 1:] * prev_eq
+            else:
+                # If equal to problem_n-1/2, set to _NONE.
+                prev_eq = idxs[:, 1:, :1] == idxs[:, :-1, :1]
+                idxs[:, 1:, :-1] = idxs[:, 1:, :-1] * np.invert(prev_eq)
+            # Set to None if problem_n-1/2 was None.
+            idxs[:, 1:] = idxs[:, 1:] * idxs[:, :-1, :1].astype(np.bool)
+        idxs = idxs[:, :, 0]
+        labels = np.array(list(LABEL_GLOBAL["problem_1"]["values"].keys()))[np.ravel(idxs)].reshape(idxs.shape)
+        y[[(f"problem_{n}", "CLASS") for n in [1, 2, 3]]] = labels
+        y[("problem_amount", "CLASS")] = np.sum(idxs.astype(np.bool), axis=1)
+        print(np.sum(np.char.equal(y[("problem_3", "CLASS")].values.astype("U"), _NONE)))
+
+        for problem in PROBLEMS.values():
+            problem_cols = [(f"problem_{n}", "CLASS") for n in range(1, 4)]
+            relevant_rows = np.any(np.equal(y[problem_cols].astype("U"), np.array([problem]).astype("U")), axis=1)
+            if np.sum(relevant_rows):
+                for attr in self.labels_class.keys():
+                    machine_attr = f"problem_{problem}_{attr}"
+                    _predict_class(relevant_rows, machine_attr, attr, self.machines, LABEL_PROBLEM)
+                for attr in self.labels_multi.keys():
+                    attr = f"problem_{problem}_{attr}"
+                    classes = self.machines[attr].predict(X[np.ix_(relevant_rows)]).astype(np.int).astype("U")
+                    y.loc[:, (attr, "MULTICLASS")] = "0" * classes.shape[1]
+                    y.loc[relevant_rows, (attr, "MULTICLASS")] = [''.join(row)[:-1] for row in classes]
+                for attr in self.labels_real.keys():
+                    y.loc[:, (attr, "REAL")] = 0
+                    pred = np.clip(self.machines[attr].predict(X[np.ix_(relevant_rows)]), 0, 1)
+                    pred = pred * LABEL_PROBLEM_REAL[attr]["scale"] + LABEL_PROBLEM_REAL[attr]["offset"]
+                    y.loc[relevant_rows, (attr, "REAL")] = pred
+
+        df = data.copy()
+        df.pred = y
+        return df
+
+
+    def feature_importances(self):
+        """Used to get all feature importances of internal classifiers.
+           Supplied models must support model.feature_importances_
+
+        :return: DataFrame. Feature importances of internal classifiers.
+        """
+        df = pandas.DataFrame(index=self.columns, columns=list(self.machines.keys()))
+        df.index.set_names(["feature_name", "day"], inplace=True)
+        for attr, machine in self.machines.items():
+            try:
+                df[attr] = machine.feature_importances_
+            except TypeError:
+                raise FeatureImportanceMissingError()
+        return df
+
+    @staticmethod
+    def f1(predicted_data):
+        """
+
+        :param predicted_data: LabeledData with filled out LabeledData.label and
+               LabaledData.pred
+        :return: Series with F1 score of all possible classes.
+        """
+        p = {}
+        r = {}
+        f1_score = {}
+        columns = [(column, d["values"].keys()) for column, d in LABEL_GLOBAL.items() if d["train"]]
+        real_columns = []
+        for problem in PROBLEMS.values():
+            prefix = f"problem_{problem}_"
+            columns += [(prefix + attr, d["values"].keys()) for attr, d in LABEL_PROBLEM.items() if d["train"]]
+            real_columns += [prefix + attr for attr, d in LABEL_PROBLEM_REAL.items() if d["train"]]
+        for column, classes in columns:
+            for cat in classes:
+                idx = (column, cat)
+                cat = str(cat)
+                truth = predicted_data.label[column].replace(np.nan, _NONE, regex=True).values.astype("U")
+                y = predicted_data.pred[column].replace(np.nan, _NONE, regex=True).values.astype("U")
+                if np.any(np.char.equal(y, cat)):
+                    p[idx] = np.sum(np.char.equal(truth, cat) * np.char.equal(truth, y)) / np.sum(np.char.equal(y, cat))
+                else:
+                    p[idx] = 0
+                if np.any(np.char.equal(truth, cat)):
+                    r[idx] = np.sum(np.char.equal(y, cat) * np.char.equal(truth, y)) / np.sum(np.char.equal(truth, cat))
+                else:
+                    r[idx] = 0
+                if p[idx] + r[idx]:
+                    f1_score[idx] = 2 * p[idx] * r[idx] / (p[idx] + r[idx])
+                else:
+                    f1_score[idx] = 0
+
+        diff = predicted_data.pred[real_columns] - predicted_data.label[real_columns]
+        rmse = np.sqrt(np.sum(np.square(diff)) / predicted_data.pred.shape[0]).transpose()
+
+        df = pandas.DataFrame({"f1": f1_score, "precision": p, "recall": r})
+        df.index.set_names(["property", "class"], inplace=True)
+        df["rmse"] = rmse
+        return df
 
 
 class Error(Exception):
@@ -216,43 +390,5 @@ class NotFittedError(Error):
     pass
 
 
-if __name__ == '__main__':
-    def machine_creator(indata, outdata):
-        model = Sequential()
-        model.add(LSTM(200, activation='tanh', input_shape=indata))
-        model.add(Dense(units=outdata, activation='softmax'))
-        model.compile(optimizer='adam', loss='categorical_crossentropy')
-        return model
-
-    days = 7
-    regobs_types = list(REG_ENG.keys())
-    print("Reading csv")
-    labeled_data = None
-    try:
-        labeled_data = LabeledData.from_csv(days=days, regobs_types=regobs_types)
-    except CsvMissingError:
-        forecast_dataset = ForecastDataset(regobs_types=regobs_types)
-        labeled_data = forecast_dataset.label(days=days)
-        labeled_data.to_csv()
-
-    print("Running classifier")
-    kf = KFold(n_splits=5, shuffle=True)
-    for split_idx, (train_index, test_index) in enumerate(kf.split(labeled_data.data)):
-        training_data = labeled_data.copy()
-        training_data.data = labeled_data.data.iloc[train_index]
-        training_data.label = labeled_data.label.iloc[train_index]
-        testing_data = labeled_data.copy()
-        testing_data.data = labeled_data.data.iloc[test_index]
-        testing_data.label = labeled_data.label.iloc[test_index]
-
-        bm = BulletinMachine(machine_creator)
-        bm.fit(training_data, True, 80)
-        predictions = bm.predict(testing_data)
-        predictions.to_csv("pred.csv", sep=';')
-
-        for column in ["danger_level", "emergency_warning", "problem_amount", "problem_1", "problem_2", "problem_3"]:
-            print(column)
-            weighted_f1 = f1_score(testing_data.label[column], predictions[column], average='weighted')
-            macro_f1 = f1_score(testing_data.label[column], predictions[column], average='macro')
-            print(f"Weighted F1 score for {column} in split {split_idx}: {weighted_f1}")
-            print(f"Macro F1 score for {column} in split {split_idx}: {macro_f1}")
+class FeatureImportanceMissingError(Error):
+    pass
