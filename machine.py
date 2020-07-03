@@ -140,18 +140,18 @@ LABEL_PROBLEM_MULTI = {
 }
 
 LABEL_PROBLEM_REAL = {
-    #"lev_max": {
-    #    "train": True,
-    #    "ext_attr": "exposed_height_1",
-    #    "offset": 0,
-    #    "scale": 1800
-    #},
-    #"lev_min": {
-    #    "train": True,
-    #    "ext_attr": "exposed_height_2",
-    #    "offset": 0,
-    #    "scale": 1600
-    #}
+    "lev_max": {
+        "train": True,
+        "ext_attr": "exposed_height_1",
+        "offset": 0,
+        "scale": 1800
+    },
+    "lev_min": {
+        "train": True,
+        "ext_attr": "exposed_height_2",
+        "offset": 0,
+        "scale": 1600
+    }
 }
 
 
@@ -220,7 +220,7 @@ class BulletinMachine:
 
         labels = [(i, "single") for i in self.labels_class.items()]
         labels += [(i, "multi") for i in self.labels_multi.items()]
-        labels += [((key, pandas.DataFrame(columns=[1])), "real") for key in self.labels_multi.keys()]
+        #labels += [((key, pandas.DataFrame(columns=[1])), "real") for key in self.labels_real.keys()]
         for (label, dummies), type in labels:
             self.X = labeled_data.data.values
             machine_creator = {
@@ -293,21 +293,20 @@ class BulletinMachine:
         labels = np.array(list(LABEL_GLOBAL["problem_1"]["values"].keys()))[np.ravel(idxs)].reshape(idxs.shape)
         y[[(f"problem_{n}", "CLASS") for n in [1, 2, 3]]] = labels
         y[("problem_amount", "CLASS")] = np.sum(idxs.astype(np.bool), axis=1)
-        print(np.sum(np.char.equal(y[("problem_3", "CLASS")].values.astype("U"), _NONE)))
 
         for problem in PROBLEMS.values():
             problem_cols = [(f"problem_{n}", "CLASS") for n in range(1, 4)]
             relevant_rows = np.any(np.equal(y[problem_cols].astype("U"), np.array([problem]).astype("U")), axis=1)
             if np.sum(relevant_rows):
-                for attr in self.labels_class.keys():
+                for attr in [prop[0] for prop in LABEL_PROBLEM.items() if prop[1]["train"]]:
                     machine_attr = f"problem_{problem}_{attr}"
                     _predict_class(relevant_rows, machine_attr, attr, self.machines, LABEL_PROBLEM)
-                for attr in self.labels_multi.keys():
+                for attr in [prop[0] for prop in LABEL_PROBLEM_MULTI.items() if prop[1]["train"]]:
                     attr = f"problem_{problem}_{attr}"
                     classes = self.machines[attr].predict(X[np.ix_(relevant_rows)]).astype(np.int).astype("U")
                     y.loc[:, (attr, "MULTICLASS")] = "0" * classes.shape[1]
                     y.loc[relevant_rows, (attr, "MULTICLASS")] = [''.join(row)[:-1] for row in classes]
-                for attr in self.labels_real.keys():
+                for attr in [(prop[0], prop[1]) for prop in LABEL_PROBLEM_REAL.items() if prop[1]["train"]]:
                     y.loc[:, (attr, "REAL")] = 0
                     pred = np.clip(self.machines[attr].predict(X[np.ix_(relevant_rows)]), 0, 1)
                     pred = pred * LABEL_PROBLEM_REAL[attr]["scale"] + LABEL_PROBLEM_REAL[attr]["offset"]
