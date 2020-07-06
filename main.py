@@ -1,13 +1,13 @@
 from aggregatedata import ForecastDataset, LabeledData, REG_ENG, CsvMissingError
 from machine import BulletinMachine
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import BayesianRidge
+from sklearn.linear_model import MultiTaskElasticNet
 
 def classifier_creator(indata, outdata):
     return RandomForestClassifier()
 
 def regressor_creator(indata, outdata):
-    return BayesianRidge()
+    return MultiTaskElasticNet()
 
 days = 7
 regobs_types = list(REG_ENG.keys())
@@ -31,7 +31,7 @@ for split_idx, (training_data, testing_data) in enumerate(labeled_data.kfold(5))
     labeled_data.pred.loc[predicted_data.pred.index] = predicted_data.pred
     split_imp = bm.feature_importances()
     importances = split_imp if importances is None else importances + (split_imp - importances) / (split_idx + 1)
-    f1_series = bm.f1(predicted_data)
+    f1_series = predicted_data.f1()
     f1 = f1_series if f1 is None else f1 + (f1_series - f1) / (split_idx + 1)
     break
 
